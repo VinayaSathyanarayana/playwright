@@ -15,11 +15,19 @@
  * limitations under the License.
  */
 
+import { TimeoutOptions } from './types';
+import { helper } from './helper';
+
 const DEFAULT_TIMEOUT = 30000;
 
 export class TimeoutSettings {
+  private _parent: TimeoutSettings | undefined;
   private _defaultTimeout: number | null = null;
   private _defaultNavigationTimeout: number | null = null;
+
+  constructor(parent?: TimeoutSettings) {
+    this._parent = parent;
+  }
 
   setDefaultTimeout(timeout: number) {
     this._defaultTimeout = timeout;
@@ -34,12 +42,28 @@ export class TimeoutSettings {
       return this._defaultNavigationTimeout;
     if (this._defaultTimeout !== null)
       return this._defaultTimeout;
+    if (this._parent)
+      return this._parent.navigationTimeout();
     return DEFAULT_TIMEOUT;
   }
 
-  timeout() {
+  private _timeout(): number {
     if (this._defaultTimeout !== null)
       return this._defaultTimeout;
+    if (this._parent)
+      return this._parent._timeout();
     return DEFAULT_TIMEOUT;
+  }
+
+  computeDeadline(options?: TimeoutOptions) {
+    const { timeout } = options || {};
+    return TimeoutSettings.computeDeadline(typeof timeout === 'number' ? timeout : this._timeout());
+  }
+
+  static computeDeadline(timeout: number): number {
+    if (timeout === 0)
+      return Number.MAX_SAFE_INTEGER;
+    else
+      return helper.monotonicTime() + timeout;
   }
 }

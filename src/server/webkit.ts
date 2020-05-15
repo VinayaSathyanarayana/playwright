@@ -15,267 +15,313 @@
  * limitations under the License.
  */
 
-import { BrowserFetcher, BrowserFetcherOptions } from './browserFetcher';
-import { DeviceDescriptors } from '../deviceDescriptors';
-import { TimeoutError } from '../errors';
-import * as types from '../types';
 import { WKBrowser } from '../webkit/wkBrowser';
-import { execSync } from 'child_process';
 import { PipeTransport } from './pipeTransport';
 import { launchProcess } from './processLauncher';
 import * as fs from 'fs';
 import * as path from 'path';
-import * as platform from '../platform';
-import * as util from 'util';
 import * as os from 'os';
-import { assert } from '../helper';
+import * as util from 'util';
+import { helper, assert } from '../helper';
 import { kBrowserCloseMessageId } from '../webkit/wkConnection';
-import { LaunchOptions, BrowserArgOptions, BrowserType } from './browserType';
-import { ConnectionTransport } from '../transport';
+import { LaunchOptions, BrowserArgOptions, LaunchServerOptions, ConnectOptions, AbstractBrowserType, processBrowserArgOptions } from './browserType';
+import { ConnectionTransport, SequenceNumberMixer, WebSocketTransport } from '../transport';
 import * as ws from 'ws';
-import * as uuidv4 from 'uuid/v4';
-import { ConnectOptions } from '../browser';
-import { BrowserApp } from './browserApp';
+import { LaunchType } from '../browser';
+import { BrowserServer, WebSocketWrapper } from './browserServer';
 import { Events } from '../events';
+import { BrowserContext } from '../browserContext';
+import { InnerLogger, logError, RootLogger } from '../logger';
+import { BrowserDescriptor } from '../install/browserPaths';
+import { TimeoutSettings } from '../timeoutSettings';
 
-export class WebKit implements BrowserType {
-  private _projectRoot: string;
-  readonly _revision: string;
-
-  constructor(projectRoot: string, preferredRevision: string) {
-    this._projectRoot = projectRoot;
-    this._revision = preferredRevision;
+export class WebKit extends AbstractBrowserType<WKBrowser> {
+  constructor(packagePath: string, browser: BrowserDescriptor) {
+    super(packagePath, browser);
   }
 
-  name() {
-    return 'webkit';
+  async launch(options: LaunchOptions = {}): Promise<WKBrowser> {
+    assert(!(options as any).userDataDir, 'userDataDir option is not supported in `browserType.launch`. Use `browserType.launchPersistentContext` instead');
+    const { timeout = 30000 } = options;
+    const deadline = TimeoutSettings.computeDeadline(timeout);
+    const { browserServer, transport, downloadsPath, logger } = await this._launchServer(options, 'local');
+    return await browserServer._initializeOrClose(deadline, async () => {
+      if ((options as any).__testHookBeforeCreateBrowser)
+        await (options as any).__testHookBeforeCreateBrowser();
+      return await WKBrowser.connect(transport!, {
+        slowMo: options.slowMo,
+        headful: !processBrowserArgOptions(options).headless,
+        logger,
+        downloadsPath,
+        ownedServer: browserServer
+      });
+    });
   }
 
-  async launch(options?: LaunchOptions): Promise<WKBrowser> {
-    const app = await this.launchBrowserApp(options);
-    const browser = await WKBrowser.connect(app.connectOptions());
-    // Hack: for typical launch scenario, ensure that close waits for actual process termination.
-    browser.close = () => app.close();
-    return browser;
+  async launchServer(options: LaunchServerOptions = {}): Promise<BrowserServer> {
+    return (await this._launchServer(options, 'server')).browserServer;
   }
 
-  async launchBrowserApp(options: LaunchOptions = {}): Promise<BrowserApp> {
+  async launchPersistentContext(userDataDir: string, options: LaunchOptions = {}): Promise<BrowserContext> {
+    const { timeout = 30000 } = options;
+    const deadline = TimeoutSettings.computeDeadline(timeout);
+    const { transport, browserServer, logger, downloadsPath } = await this._launchServer(options, 'persistent', userDataDir);
+    return await browserServer._initializeOrClose(deadline, async () => {
+      if ((options as any).__testHookBeforeCreateBrowser)
+        await (options as any).__testHookBeforeCreateBrowser();
+      const browser = await WKBrowser.connect(transport!, {
+        slowMo: options.slowMo,
+        headful: !processBrowserArgOptions(options).headless,
+        logger,
+        persistent: true,
+        downloadsPath,
+        ownedServer: browserServer
+      });
+      const context = browser._defaultContext!;
+      if (!options.ignoreDefaultArgs || Array.isArray(options.ignoreDefaultArgs))
+        await context._loadDefaultContext();
+      return context;
+    });
+  }
+
+  private async _launchServer(options: LaunchServerOptions, launchType: LaunchType, userDataDir?: string): Promise<{ browserServer: BrowserServer, transport?: ConnectionTransport, downloadsPath: string, logger: InnerLogger }> {
     const {
       ignoreDefaultArgs = false,
       args = [],
-      dumpio = false,
       executablePath = null,
       env = process.env,
       handleSIGINT = true,
       handleSIGTERM = true,
       handleSIGHUP = true,
-      slowMo = 0,
-      webSocket = false,
+      port = 0,
     } = options;
+    assert(!port || launchType === 'server', 'Cannot specify a port without launching as a server.');
+    const logger = new RootLogger(options.logger);
+
+    let temporaryUserDataDir: string | null = null;
+    if (!userDataDir) {
+      userDataDir = await mkdtempAsync(WEBKIT_PROFILE_PATH);
+      temporaryUserDataDir = userDataDir;
+    }
 
     const webkitArguments = [];
     if (!ignoreDefaultArgs)
-      webkitArguments.push(...this.defaultArgs(options));
+      webkitArguments.push(...this._defaultArgs(options, launchType, userDataDir, port));
     else if (Array.isArray(ignoreDefaultArgs))
-      webkitArguments.push(...this.defaultArgs(options).filter(arg => ignoreDefaultArgs.indexOf(arg) === -1));
+      webkitArguments.push(...this._defaultArgs(options, launchType, userDataDir, port).filter(arg => ignoreDefaultArgs.indexOf(arg) === -1));
     else
       webkitArguments.push(...args);
 
-    let userDataDir: string;
-    let temporaryUserDataDir: string | null = null;
-    const userDataDirArg = webkitArguments.find(arg => arg.startsWith('--user-data-dir='));
-    if (userDataDirArg) {
-      userDataDir = userDataDirArg.substr('--user-data-dir='.length).trim();
-    } else {
-      userDataDir = await mkdtempAsync(WEBKIT_PROFILE_PATH);
-      temporaryUserDataDir = userDataDir;
-      webkitArguments.push(`--user-data-dir=${temporaryUserDataDir}`);
-    }
+    const webkitExecutable = executablePath || this.executablePath();
+    if (!webkitExecutable)
+      throw new Error(`No executable path is specified.`);
 
-    let webkitExecutable = executablePath;
-    if (!executablePath) {
-      const {missingText, executablePath} = this._resolveExecutablePath();
-      if (missingText)
-        throw new Error(missingText);
-      webkitExecutable = executablePath;
-    }
-
-    let transport: PipeTransport | undefined = undefined;
-    let browserApp: BrowserApp | undefined = undefined;
-    const { launchedProcess, gracefullyClose } = await launchProcess({
-      executablePath: webkitExecutable!,
+    // Note: it is important to define these variables before launchProcess, so that we don't get
+    // "Cannot access 'browserServer' before initialization" if something went wrong.
+    let transport: ConnectionTransport | undefined = undefined;
+    let browserServer: BrowserServer | undefined = undefined;
+    const { launchedProcess, gracefullyClose, downloadsPath } = await launchProcess({
+      executablePath: webkitExecutable,
       args: webkitArguments,
       env: { ...env, CURL_COOKIE_JAR_PATH: path.join(userDataDir, 'cookiejar.db') },
       handleSIGINT,
       handleSIGTERM,
       handleSIGHUP,
-      dumpio,
+      logger,
       pipe: true,
       tempDir: temporaryUserDataDir || undefined,
       attemptToGracefullyClose: async () => {
-        if (!transport)
-          return Promise.reject();
+        assert(transport);
         // We try to gracefully close to prevent crash reporting and core dumps.
         // Note that it's fine to reuse the pipe transport, since
         // our connection ignores kBrowserCloseMessageId.
-        const message = JSON.stringify({method: 'Browser.close', params: {}, id: kBrowserCloseMessageId});
-        transport.send(message);
+        await transport.send({method: 'Playwright.close', params: {}, id: kBrowserCloseMessageId});
       },
       onkill: (exitCode, signal) => {
-        if (browserApp)
-          browserApp.emit(Events.BrowserApp.Close, exitCode, signal);
+        if (browserServer)
+          browserServer.emit(Events.BrowserServer.Close, exitCode, signal);
       },
     });
 
-    transport = new PipeTransport(launchedProcess.stdio[3] as NodeJS.WritableStream, launchedProcess.stdio[4] as NodeJS.ReadableStream);
-
-    let connectOptions: ConnectOptions;
-    if (webSocket) {
-      const browserWSEndpoint = wrapTransportWithWebSocket(transport);
-      connectOptions = { browserWSEndpoint, slowMo };
-    } else {
-      connectOptions = { transport, slowMo };
-    }
-    browserApp = new BrowserApp(launchedProcess, gracefullyClose, connectOptions);
-    return browserApp;
+    const stdio = launchedProcess.stdio as unknown as [NodeJS.ReadableStream, NodeJS.WritableStream, NodeJS.WritableStream, NodeJS.WritableStream, NodeJS.ReadableStream];
+    transport = new PipeTransport(stdio[3], stdio[4], logger);
+    browserServer = new BrowserServer(launchedProcess, gracefullyClose, launchType === 'server' ? wrapTransportWithWebSocket(transport, logger, port || 0) : null);
+    return { browserServer, transport, downloadsPath, logger };
   }
 
-  async connect(options: ConnectOptions & { browserURL?: string }): Promise<WKBrowser> {
-    if (options.browserURL)
-      throw new Error('Option "browserURL" is not supported by Firefox');
-    if (options.transport && options.transport.onmessage)
-      throw new Error('Transport is already in use');
-    return WKBrowser.connect(options);
-  }
-
-  executablePath(): string {
-    return this._resolveExecutablePath().executablePath;
-  }
-
-  get devices(): types.Devices {
-    return DeviceDescriptors;
-  }
-
-  get errors(): { TimeoutError: typeof TimeoutError } {
-    return { TimeoutError };
-  }
-
-  defaultArgs(options: BrowserArgOptions = {}): string[] {
-    const {
-      devtools = false,
-      headless = !devtools,
-      args = [],
-      userDataDir = null
-    } = options;
-    if (devtools)
-      throw new Error('Option "devtools" is not supported by WebKit');
-    const webkitArguments = ['--inspector-pipe'];
-    if (userDataDir)
-      webkitArguments.push(`--user-data-dir=${userDataDir}`);
-    if (headless)
-      webkitArguments.push('--headless');
-    webkitArguments.push(...args);
-    return webkitArguments;
-  }
-
-  _createBrowserFetcher(options?: BrowserFetcherOptions): BrowserFetcher {
-    const downloadURLs = {
-      linux: '%s/builds/webkit/%s/minibrowser-gtk-wpe.zip',
-      mac: '%s/builds/webkit/%s/minibrowser-mac-%s.zip',
-      win64: '%s/builds/webkit/%s/minibrowser-win64.zip',
-    };
-
-    const defaultOptions = {
-      path: path.join(this._projectRoot, '.local-webkit'),
-      host: 'https://playwright.azureedge.net',
-      platform: (() => {
-        const platform = os.platform();
-        if (platform === 'darwin')
-          return 'mac';
-        if (platform === 'linux')
-          return 'linux';
-        if (platform === 'win32')
-          return 'win64';
-        return platform;
-      })()
-    };
-    options = {
-      ...defaultOptions,
-      ...options,
-    };
-    assert(!!(downloadURLs as any)[options.platform!], 'Unsupported platform: ' + options.platform);
-
-    return new BrowserFetcher(options.path!, options.platform!, this._revision, (platform: string, revision: string) => {
-      return {
-        downloadUrl: (platform === 'mac') ?
-          util.format(downloadURLs[platform], options!.host, revision, getMacVersion()) :
-          util.format((downloadURLs as any)[platform], options!.host, revision),
-        executablePath: platform.startsWith('win') ? 'MiniBrowser.exe' : 'pw_run.sh',
-      };
+  async connect(options: ConnectOptions): Promise<WKBrowser> {
+    return await WebSocketTransport.connect(options.wsEndpoint, async transport => {
+      if ((options as any).__testHookBeforeCreateBrowser)
+        await (options as any).__testHookBeforeCreateBrowser();
+      return WKBrowser.connect(transport, { slowMo: options.slowMo, logger: new RootLogger(options.logger), downloadsPath: '' });
     });
   }
 
-  _resolveExecutablePath(): { executablePath: string; missingText: string | null; } {
-    const browserFetcher = this._createBrowserFetcher();
-    const revisionInfo = browserFetcher.revisionInfo();
-    const missingText = !revisionInfo.local ? `WebKit revision is not downloaded. Run "npm install" or "yarn install"` : null;
-    return { executablePath: revisionInfo.executablePath, missingText };
+  _defaultArgs(options: BrowserArgOptions = {}, launchType: LaunchType, userDataDir: string, port: number): string[] {
+    const { devtools, headless } = processBrowserArgOptions(options);
+    const { args = [] } = options;
+    if (devtools)
+      console.warn('devtools parameter as a launch argument in WebKit is not supported. Also starting Web Inspector manually will terminate the execution in WebKit.');
+    const userDataDirArg = args.find(arg => arg.startsWith('--user-data-dir='));
+    if (userDataDirArg)
+      throw new Error('Pass userDataDir parameter instead of specifying --user-data-dir argument');
+    if (args.find(arg => !arg.startsWith('-')))
+      throw new Error('Arguments can not specify page to be opened');
+    const webkitArguments = ['--inspector-pipe'];
+    if (headless)
+      webkitArguments.push('--headless');
+    if (launchType === 'persistent')
+      webkitArguments.push(`--user-data-dir=${userDataDir}`);
+    else
+      webkitArguments.push(`--no-startup-window`);
+    webkitArguments.push(...args);
+    if (launchType === 'persistent')
+      webkitArguments.push('about:blank');
+    return webkitArguments;
   }
 }
 
-const mkdtempAsync = platform.promisify(fs.mkdtemp);
+const mkdtempAsync = util.promisify(fs.mkdtemp);
 
 const WEBKIT_PROFILE_PATH = path.join(os.tmpdir(), 'playwright_dev_profile-');
 
-let cachedMacVersion: string | undefined = undefined;
+function wrapTransportWithWebSocket(transport: ConnectionTransport, logger: InnerLogger, port: number): WebSocketWrapper {
+  const server = new ws.Server({ port });
+  const guid = helper.guid();
+  const idMixer = new SequenceNumberMixer<{id: number, socket: ws}>();
+  const pendingBrowserContextCreations = new Set<number>();
+  const pendingBrowserContextDeletions = new Map<number, string>();
+  const browserContextIds = new Map<string, ws>();
+  const pageProxyIds = new Map<string, ws>();
+  const sockets = new Set<ws>();
 
-function getMacVersion(): string {
-  if (!cachedMacVersion) {
-    const [major, minor] = execSync('sw_vers -productVersion').toString('utf8').trim().split('.');
-    assert(+major === 10 && +minor >= 14, 'Error: unsupported macOS version, macOS 10.14 and newer are supported');
-    cachedMacVersion = major + '.' + minor;
-  }
-  return cachedMacVersion;
-}
+  transport.onmessage = message => {
+    if (typeof message.id === 'number') {
+      if (message.id === -9999)
+        return;
+      // Process command response.
+      const value = idMixer.take(message.id);
+      if (!value)
+        return;
+      const { id, socket } = value;
 
-function wrapTransportWithWebSocket(transport: ConnectionTransport) {
-  const server = new ws.Server({ port: 0 });
-  let socket: ws | undefined;
-  const guid = uuidv4();
+      if (socket.readyState === ws.CLOSING) {
+        if (pendingBrowserContextCreations.has(id)) {
+          transport.send({
+            id: ++SequenceNumberMixer._lastSequenceNumber,
+            method: 'Playwright.deleteContext',
+            params: { browserContextId: message.result.browserContextId }
+          });
+        }
+        return;
+      }
 
-  server.on('connection', (s, req) => {
-    if (req.url !== '/' + guid) {
-      s.close();
+      if (pendingBrowserContextCreations.has(message.id)) {
+        // Browser.createContext response -> establish context attribution.
+        browserContextIds.set(message.result.browserContextId, socket);
+        pendingBrowserContextCreations.delete(message.id);
+      }
+
+      const deletedContextId = pendingBrowserContextDeletions.get(message.id);
+      if (deletedContextId) {
+        // Browser.deleteContext response -> remove context attribution.
+        browserContextIds.delete(deletedContextId);
+        pendingBrowserContextDeletions.delete(message.id);
+      }
+
+      message.id = id;
+      socket.send(JSON.stringify(message));
       return;
     }
-    if (socket) {
-      s.close(undefined, 'Multiple connections are not supported');
+
+    // Process notification response.
+    const { method, params, pageProxyId } = message;
+    if (pageProxyId) {
+      const socket = pageProxyIds.get(pageProxyId);
+      if (!socket || socket.readyState === ws.CLOSING) {
+        // Drop unattributed messages on the floor.
+        return;
+      }
+      socket.send(JSON.stringify(message));
       return;
     }
-    socket = s;
-    s.on('message', message => transport.send(Buffer.from(message).toString()));
-    transport.onmessage = message => {
-      // We are not notified when socket starts closing, and sending messages to a closing
-      // socket throws an error.
-      if (s.readyState !== ws.CLOSING)
-        s.send(message);
-    };
-    s.on('close', () => {
-      socket = undefined;
-      transport.onmessage = undefined;
-    });
-  });
+    if (method === 'Playwright.pageProxyCreated') {
+      const socket = browserContextIds.get(params.pageProxyInfo.browserContextId);
+      if (!socket || socket.readyState === ws.CLOSING) {
+        // Drop unattributed messages on the floor.
+        return;
+      }
+      pageProxyIds.set(params.pageProxyInfo.pageProxyId, socket);
+      socket.send(JSON.stringify(message));
+      return;
+    }
+    if (method === 'Playwright.pageProxyDestroyed') {
+      const socket = pageProxyIds.get(params.pageProxyId);
+      pageProxyIds.delete(params.pageProxyId);
+      if (socket && socket.readyState !== ws.CLOSING)
+        socket.send(JSON.stringify(message));
+      return;
+    }
+    if (method === 'Playwright.provisionalLoadFailed') {
+      const socket = pageProxyIds.get(params.pageProxyId);
+      if (socket && socket.readyState !== ws.CLOSING)
+        socket.send(JSON.stringify(message));
+      return;
+    }
+  };
 
   transport.onclose = () => {
-    if (socket)
+    for (const socket of sockets) {
+      socket.removeListener('close', (socket as any).__closeListener);
       socket.close(undefined, 'Browser disconnected');
+    }
     server.close();
     transport.onmessage = undefined;
     transport.onclose = undefined;
   };
 
+  server.on('connection', (socket: ws, req) => {
+    if (req.url !== '/' + guid) {
+      socket.close();
+      return;
+    }
+    sockets.add(socket);
+
+    socket.on('message', (message: string) => {
+      const parsedMessage = JSON.parse(Buffer.from(message).toString());
+      const { id, method, params } = parsedMessage;
+      const seqNum = idMixer.generate({ id, socket });
+      transport.send({ ...parsedMessage, id: seqNum });
+      if (method === 'Playwright.createContext')
+        pendingBrowserContextCreations.add(seqNum);
+      if (method === 'Playwright.deleteContext')
+        pendingBrowserContextDeletions.set(seqNum, params.browserContextId);
+    });
+
+    socket.on('error', logError(logger));
+
+    socket.on('close', (socket as any).__closeListener = () => {
+      for (const [pageProxyId, s] of pageProxyIds) {
+        if (s === socket)
+          pageProxyIds.delete(pageProxyId);
+      }
+      for (const [browserContextId, s] of browserContextIds) {
+        if (s === socket) {
+          transport.send({
+            id: ++SequenceNumberMixer._lastSequenceNumber,
+            method: 'Playwright.deleteContext',
+            params: { browserContextId }
+          });
+          browserContextIds.delete(browserContextId);
+        }
+      }
+      sockets.delete(socket);
+    });
+  });
+
   const address = server.address();
-  if (typeof address === 'string')
-    return address + '/' + guid;
-  return 'ws://127.0.0.1:' + address.port + '/' + guid;
+  const wsEndpoint = typeof address === 'string' ? `${address}/${guid}` : `ws://127.0.0.1:${address.port}/${guid}`;
+
+  return new WebSocketWrapper(wsEndpoint,
+      [pendingBrowserContextCreations, pendingBrowserContextDeletions, browserContextIds, pageProxyIds, sockets]);
 }

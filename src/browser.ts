@@ -15,32 +15,91 @@
  */
 
 import { BrowserContext, BrowserContextOptions } from './browserContext';
-import { ConnectionTransport, SlowMoTransport } from './transport';
-import * as platform from './platform';
-import { assert } from './helper';
+import { Page } from './page';
+import { EventEmitter } from 'events';
+import { Download } from './download';
+import type { BrowserServer } from './server/browserServer';
+import { Events } from './events';
+import { InnerLogger, Log } from './logger';
+import * as types from './types';
 
-export interface Browser extends platform.EventEmitterType {
+export type BrowserOptions = {
+  logger: InnerLogger,
+  downloadsPath: string,
+  headful?: boolean,
+  persistent?: boolean,
+  slowMo?: number,
+  viewport?: types.Size | null,
+  ownedServer?: BrowserServer,
+};
+
+export interface Browser extends EventEmitter {
   newContext(options?: BrowserContextOptions): Promise<BrowserContext>;
-  browserContexts(): BrowserContext[];
-  defaultContext(): BrowserContext;
-
-  disconnect(): Promise<void>;
+  contexts(): BrowserContext[];
+  newPage(options?: BrowserContextOptions): Promise<Page>;
   isConnected(): boolean;
   close(): Promise<void>;
 }
 
-export type ConnectOptions = {
-  slowMo?: number,
-  browserWSEndpoint?: string;
-  transport?: ConnectionTransport;
-};
+export abstract class BrowserBase extends EventEmitter implements Browser, InnerLogger {
+  readonly _options: BrowserOptions;
+  private _downloads = new Map<string, Download>();
 
-export async function createTransport(options: ConnectOptions): Promise<ConnectionTransport> {
-  assert(Number(!!options.browserWSEndpoint) + Number(!!options.transport) === 1, 'Exactly one of browserWSEndpoint or transport must be passed to connect');
-  let transport: ConnectionTransport | undefined;
-  if (options.transport)
-    transport = options.transport;
-  else if (options.browserWSEndpoint)
-    transport = await platform.createWebSocketTransport(options.browserWSEndpoint);
-  return SlowMoTransport.wrap(transport!, options.slowMo);
+  constructor(options: BrowserOptions) {
+    super();
+    this._options = options;
+  }
+
+  abstract newContext(options?: BrowserContextOptions): Promise<BrowserContext>;
+  abstract contexts(): BrowserContext[];
+  abstract isConnected(): boolean;
+  abstract _disconnect(): void;
+
+  async newPage(options?: BrowserContextOptions): Promise<Page> {
+    const context = await this.newContext(options);
+    const page = await context.newPage();
+    page._ownedContext = context;
+    return page;
+  }
+
+  _downloadCreated(page: Page, uuid: string, url: string, suggestedFilename?: string) {
+    const download = new Download(page, this._options.downloadsPath, uuid, url, suggestedFilename);
+    this._downloads.set(uuid, download);
+  }
+
+  _downloadFilenameSuggested(uuid: string, suggestedFilename: string) {
+    const download = this._downloads.get(uuid);
+    if (!download)
+      return;
+    download._filenameSuggested(suggestedFilename);
+  }
+
+  _downloadFinished(uuid: string, error?: string) {
+    const download = this._downloads.get(uuid);
+    if (!download)
+      return;
+    download._reportFinished(error);
+    this._downloads.delete(uuid);
+  }
+
+  async close() {
+    if (this._options.ownedServer) {
+      await this._options.ownedServer.close();
+    } else {
+      await Promise.all(this.contexts().map(context => context.close()));
+      this._disconnect();
+    }
+    if (this.isConnected())
+      await new Promise(x => this.once(Events.Browser.Disconnected, x));
+  }
+
+  _isLogEnabled(log: Log): boolean {
+    return this._options.logger._isLogEnabled(log);
+  }
+
+  _log(log: Log, message: string | Error, ...args: any[]) {
+    return this._options.logger._log(log, message, ...args);
+  }
 }
+
+export type LaunchType = 'local' | 'server' | 'persistent';

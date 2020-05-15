@@ -4,29 +4,39 @@ const fs = require('fs');
 const StreamZip = require('node-stream-zip');
 const vm = require('vm');
 const os = require('os');
+const util = require('util');
 
-async function generateChromiunProtocol(revision) {
+async function generateProtocol(name, executablePath) {
+  if (name === 'chromium')
+    return generateChromiumProtocol(executablePath);
+  if (name === 'firefox')
+    return generateFirefoxProtocol(executablePath);
+  if (name === 'webkit')
+    return generateWebKitProtocol(executablePath);
+}
+
+async function generateChromiumProtocol(executablePath) {
   const outputPath = path.join(__dirname, '..', '..', 'src', 'chromium', 'protocol.ts');
-  if (revision.local && fs.existsSync(outputPath))
-    return;
-  const playwright = await require('../../index').chromium;
-  const browserApp = await playwright.launchBrowserApp({executablePath: revision.executablePath, webSocket: true});
-  const origin = browserApp.wsEndpoint().match(/ws:\/\/([0-9A-Za-z:\.]*)\//)[1];
-  const browser = await playwright.connect(browserApp.connectOptions());
-  const page = await browser.defaultContext().newPage();
-  await page.goto(`http://${origin}/json/protocol`);
+  const playwright = await require('../../index-for-dev').chromium;
+  const defaultArgs = playwright._defaultArgs.bind(playwright);
+  playwright._defaultArgs = (...args) => {
+    const result = defaultArgs(...args);
+    result.push('--remote-debugging-port=9339');
+    return result;
+  };
+  const browser = await playwright.launch({ executablePath });
+  const page = await browser.newPage();
+  await page.goto(`http://localhost:9339/json/protocol`);
   const json = JSON.parse(await page.evaluate(() => document.documentElement.innerText));
-  await browserApp.close();
-  fs.writeFileSync(outputPath, jsonToTS(json));
+  await browser.close();
+  await fs.promises.writeFile(outputPath, jsonToTS(json));
   console.log(`Wrote protocol.ts to ${path.relative(process.cwd(), outputPath)}`);
 }
 
-async function generateWebKitProtocol(revision) {
+async function generateWebKitProtocol(folderPath) {
   const outputPath = path.join(__dirname, '..', '..', 'src', 'webkit', 'protocol.ts');
-  if (revision.local && fs.existsSync(outputPath))
-    return;
-  const json = JSON.parse(fs.readFileSync(path.join(revision.folderPath, 'protocol.json'), 'utf8'));
-  fs.writeFileSync(outputPath, jsonToTS({domains: json}));
+  const json = JSON.parse(await fs.promises.readFile(path.join(folderPath, '..', 'protocol.json'), 'utf8'));
+  await fs.promises.writeFile(outputPath, jsonToTS({domains: json}));
   console.log(`Wrote protocol.ts for WebKit to ${path.relative(process.cwd(), outputPath)}`);
 }
 
@@ -118,13 +128,11 @@ function typeOfProperty(property, domain) {
   return property.type;
 }
 
-async function generateFirefoxProtocol(revision) {
+async function generateFirefoxProtocol(executablePath) {
   const outputPath = path.join(__dirname, '..', '..', 'src', 'firefox', 'protocol.ts');
-  if (revision.local && fs.existsSync(outputPath))
-    return;
   const omnija = os.platform() === 'darwin' ?
-    path.join(revision.executablePath, '..', '..', 'Resources', 'omni.ja') :
-    path.join(revision.executablePath, '..', 'omni.ja');
+    path.join(executablePath, '..', '..', 'Resources', 'omni.ja') :
+    path.join(executablePath, '..', 'omni.ja');
   const zip = new StreamZip({file: omnija, storeEntries: true});
   // @ts-ignore
   await new Promise(x => zip.on('ready', x));
@@ -164,7 +172,7 @@ async function generateFirefoxProtocol(revision) {
     }
   }
   const json = vm.runInContext(`(${inject})();${protocolJSCode}; this.protocol;`, ctx);
-  fs.writeFileSync(outputPath, firefoxJSONToTS(json));
+  await fs.promises.writeFile(outputPath, firefoxJSONToTS(json));
   console.log(`Wrote protocol.ts for Firefox to ${path.relative(process.cwd(), outputPath)}`);
 }
 
@@ -216,4 +224,4 @@ function firefoxTypeToString(type, indent='    ') {
   return type['$type'];
 }
 
-module.exports = {generateChromiunProtocol, generateFirefoxProtocol, generateWebKitProtocol};
+module.exports = { generateProtocol };

@@ -16,46 +16,65 @@
  */
 
 import * as childProcess from 'child_process';
-import * as stream from 'stream';
-import * as removeFolder from 'rimraf';
-import { helper } from '../helper';
+import { Log, InnerLogger } from '../logger';
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
 import * as readline from 'readline';
+import * as removeFolder from 'rimraf';
+import * as stream from 'stream';
+import * as util from 'util';
 import { TimeoutError } from '../errors';
-import * as platform from '../platform';
+import { helper } from '../helper';
 
-const debugLauncher = platform.debug('pw:launcher');
-const removeFolderAsync = platform.promisify(removeFolder);
+const removeFolderAsync = util.promisify(removeFolder);
+const mkdtempAsync = util.promisify(fs.mkdtemp);
+const DOWNLOADS_FOLDER = path.join(os.tmpdir(), 'playwright_downloads-');
+
+const browserLog: Log = {
+  name: 'browser',
+};
+
+const browserStdOutLog: Log = {
+  name: 'browser:out',
+};
+
+const browserStdErrLog: Log = {
+  name: 'browser:err',
+  severity: 'warning'
+};
+
 
 export type LaunchProcessOptions = {
   executablePath: string,
   args: string[],
-  env?: {[key: string]: string | undefined},
+  env?: {[key: string]: string | number | boolean | undefined},
 
   handleSIGINT?: boolean,
   handleSIGTERM?: boolean,
   handleSIGHUP?: boolean,
-  dumpio?: boolean,
   pipe?: boolean,
   tempDir?: string,
+
+  cwd?: string,
+  omitDownloads?: boolean,
 
   // Note: attemptToGracefullyClose should reject if it does not close the browser.
   attemptToGracefullyClose: () => Promise<any>,
   onkill: (exitCode: number | null, signal: string | null) => void,
+  logger: InnerLogger,
 };
 
-type LaunchResult = { launchedProcess: childProcess.ChildProcess, gracefullyClose: () => Promise<void> };
-
-let lastLaunchedId = 0;
+type LaunchResult = {
+  launchedProcess: childProcess.ChildProcess,
+  gracefullyClose: () => Promise<void>,
+  downloadsPath: string
+};
 
 export async function launchProcess(options: LaunchProcessOptions): Promise<LaunchResult> {
-  const id = ++lastLaunchedId;
-  let stdio: ('ignore' | 'pipe')[] = ['pipe', 'pipe', 'pipe'];
-  if (options.pipe) {
-    if (options.dumpio)
-      stdio = ['ignore', 'pipe', 'pipe', 'pipe', 'pipe'];
-    else
-      stdio = ['ignore', 'ignore', 'ignore', 'pipe', 'pipe'];
-  }
+  const logger = options.logger;
+  const stdio: ('ignore' | 'pipe')[] = options.pipe ? ['ignore', 'pipe', 'pipe', 'pipe', 'pipe'] : ['ignore', 'pipe', 'pipe'];
+  logger._log(browserLog, `<launching> ${options.executablePath} ${options.args.join(' ')}`);
   const spawnedProcess = childProcess.spawn(
       options.executablePath,
       options.args,
@@ -64,12 +83,11 @@ export async function launchProcess(options: LaunchProcessOptions): Promise<Laun
         // process group, making it possible to kill child process tree with `.kill(-pid)` command.
         // @see https://nodejs.org/api/child_process.html#child_process_options_detached
         detached: process.platform !== 'win32',
-        env: options.env,
-        stdio
+        env: (options.env as {[key: string]: string}),
+        cwd: options.cwd,
+        stdio,
       }
   );
-  debugLauncher(`[${id}] <launching> ${options.executablePath} ${options.args.join(' ')}`);
-
   if (!spawnedProcess.pid) {
     let reject: (e: Error) => void;
     const result = new Promise<LaunchResult>((f, r) => reject = r);
@@ -78,27 +96,32 @@ export async function launchProcess(options: LaunchProcessOptions): Promise<Laun
     });
     return result;
   }
+  logger._log(browserLog, `<launched> pid=${spawnedProcess.pid}`);
 
-  if (options.dumpio) {
-    spawnedProcess.stderr.pipe(process.stderr);
-    spawnedProcess.stdout.pipe(process.stdout);
-  }
+  const stdout = readline.createInterface({ input: spawnedProcess.stdout });
+  stdout.on('line', (data: string) => {
+    logger._log(browserStdOutLog, data);
+  });
+
+  const stderr = readline.createInterface({ input: spawnedProcess.stderr });
+  stderr.on('line', (data: string) => {
+    logger._log(browserStdErrLog, data);
+  });
+
+  const downloadsPath = options.omitDownloads ? '' : await mkdtempAsync(DOWNLOADS_FOLDER);
 
   let processClosed = false;
   const waitForProcessToClose = new Promise((fulfill, reject) => {
     spawnedProcess.once('exit', (exitCode, signal) => {
-      debugLauncher(`[${id}] <process did exit>`);
+      logger._log(browserLog, `<process did exit ${exitCode}, ${signal}>`);
       processClosed = true;
       helper.removeEventListeners(listeners);
       options.onkill(exitCode, signal);
       // Cleanup as processes exit.
-      if (options.tempDir) {
-        removeFolderAsync(options.tempDir)
-            .catch((err: Error) => console.error(err))
-            .then(fulfill);
-      } else {
-        fulfill();
-      }
+      Promise.all([
+        options.omitDownloads ? Promise.resolve() : removeFolderAsync(downloadsPath),
+        options.tempDir ? removeFolderAsync(options.tempDir) : Promise.resolve()
+      ]).catch((err: Error) => console.error(err)).then(fulfill);
     });
   });
 
@@ -120,20 +143,20 @@ export async function launchProcess(options: LaunchProcessOptions): Promise<Laun
     // reentrancy to this function, for example user sends SIGINT second time.
     // In this case, let's forcefully kill the process.
     if (gracefullyClosing) {
-      debugLauncher(`[${id}] <forecefully close>`);
+      logger._log(browserLog, `<forecefully close>`);
       killProcess();
       return;
     }
     gracefullyClosing = true;
-    debugLauncher(`[${id}] <gracefully close start>`);
-    options.attemptToGracefullyClose().catch(() => killProcess());
+    logger._log(browserLog, `<gracefully close start>`);
+    await options.attemptToGracefullyClose().catch(() => killProcess());
     await waitForProcessToClose;
-    debugLauncher(`[${id}] <gracefully close end>`);
+    logger._log(browserLog, `<gracefully close end>`);
   }
 
   // This method has to be sync to be used as 'exit' event handler.
   function killProcess() {
-    debugLauncher(`[${id}] <kill>`);
+    logger._log(browserLog, `<kill>`);
     helper.removeEventListeners(listeners);
     if (spawnedProcess.pid && !spawnedProcess.killed && !processClosed) {
       // Force kill the browser.
@@ -153,7 +176,7 @@ export async function launchProcess(options: LaunchProcessOptions): Promise<Laun
     } catch (e) { }
   }
 
-  return { launchedProcess: spawnedProcess, gracefullyClose };
+  return { launchedProcess: spawnedProcess, gracefullyClose, downloadsPath };
 }
 
 export function waitForLine(process: childProcess.ChildProcess, inputStream: stream.Readable, regex: RegExp, timeout: number, timeoutError: TimeoutError): Promise<RegExpMatchArray> {

@@ -16,11 +16,11 @@
  */
 
 import * as frames from '../frames';
-import { assert, debugError, helper } from '../helper';
+import { assert, helper } from '../helper';
 import * as network from '../network';
-import * as platform from '../platform';
 import { Protocol } from './protocol';
 import { WKSession } from './wkConnection';
+import { logError } from '../logger';
 
 const errorReasons: { [reason: string]: string } = {
   'aborted': 'Cancellation',
@@ -39,18 +39,19 @@ const errorReasons: { [reason: string]: string } = {
   'failed': 'General',
 };
 
-export class WKInterceptableRequest implements network.RequestDelegate {
+export class WKInterceptableRequest implements network.RouteDelegate {
   private readonly _session: WKSession;
   readonly request: network.Request;
   readonly _requestId: string;
   _interceptedCallback: () => void = () => {};
   private _interceptedPromise: Promise<unknown>;
 
-  constructor(session: WKSession, allowInterception: boolean, frame: frames.Frame | null, event: Protocol.Network.requestWillBeSentPayload, redirectChain: network.Request[], documentId: string | undefined) {
+  constructor(session: WKSession, allowInterception: boolean, frame: frames.Frame, event: Protocol.Network.requestWillBeSentPayload, redirectedFrom: network.Request | null, documentId: string | undefined) {
     this._session = session;
     this._requestId = event.requestId;
-    this.request = new network.Request(allowInterception ? this : null, frame, redirectChain, documentId, event.request.url,
-        event.type ? event.type.toLowerCase() : 'Unknown', event.request.method, event.request.postData, headersObject(event.request.headers));
+    const resourceType = event.type ? event.type.toLowerCase() : (redirectedFrom ? redirectedFrom.resourceType() : 'unknown');
+    this.request = new network.Request(allowInterception ? this : null, frame, redirectedFrom, documentId, event.request.url,
+        resourceType, event.request.method, event.request.postData || null, headersObject(event.request.headers));
     this._interceptedPromise = new Promise(f => this._interceptedCallback = f);
   }
 
@@ -61,38 +62,45 @@ export class WKInterceptableRequest implements network.RequestDelegate {
     await this._session.send('Network.interceptAsError', { requestId: this._requestId, reason }).catch(error => {
       // In certain cases, protocol will return error if the request was already canceled
       // or the page was closed. We should tolerate these errors.
-      debugError(error);
+      logError(this.request._page);
     });
   }
 
-  async fulfill(response: { status: number; headers: network.Headers; contentType: string; body: (string | platform.BufferType); }) {
+  async fulfill(response: network.FulfillResponse) {
     await this._interceptedPromise;
 
     const base64Encoded = !!response.body && !helper.isString(response.body);
-    const responseBody = response.body ? (base64Encoded ? response.body.toString('base64') : response.body as string) : undefined;
+    const responseBody = response.body ? (base64Encoded ? response.body.toString('base64') : response.body as string) : '';
 
     const responseHeaders: { [s: string]: string; } = {};
     if (response.headers) {
       for (const header of Object.keys(response.headers))
         responseHeaders[header.toLowerCase()] = String(response.headers[header]);
     }
-    if (response.contentType)
+    let mimeType = base64Encoded ? 'application/octet-stream' : 'text/plain';
+    if (response.contentType) {
       responseHeaders['content-type'] = response.contentType;
+      const index = response.contentType.indexOf(';');
+      if (index !== -1)
+        mimeType = response.contentType.substring(0, index).trimEnd();
+      else
+        mimeType = response.contentType.trim();
+    }
     if (responseBody && !('content-length' in responseHeaders))
-      responseHeaders['content-length'] = String(platform.Buffer.byteLength(responseBody));
+      responseHeaders['content-length'] = String(Buffer.byteLength(responseBody));
 
     await this._session.send('Network.interceptWithResponse', {
       requestId: this._requestId,
       status: response.status || 200,
       statusText: network.STATUS_TEXTS[String(response.status || 200)],
-      mimeType: response.contentType || (base64Encoded ? 'application/octet-stream' : 'text/plain'),
+      mimeType,
       headers: responseHeaders,
       base64Encoded,
       content: responseBody
     }).catch(error => {
       // In certain cases, protocol will return error if the request was already canceled
       // or the page was closed. We should tolerate these errors.
-      debugError(error);
+      logError(this.request._page);
     });
   }
 
@@ -106,14 +114,14 @@ export class WKInterceptableRequest implements network.RequestDelegate {
     }).catch((error: Error) => {
       // In certain cases, protocol will return error if the request was already canceled
       // or the page was closed. We should tolerate these errors.
-      debugError(error);
+      logError(this.request._page);
     });
   }
 
   createResponse(responsePayload: Protocol.Network.Response): network.Response {
     const getResponseBody = async () => {
       const response = await this._session.send('Network.getResponseBody', { requestId: this._requestId });
-      return platform.Buffer.from(response.body, response.base64Encoded ? 'base64' : 'utf8');
+      return Buffer.from(response.body, response.base64Encoded ? 'base64' : 'utf8');
     };
     return new network.Response(this.request, responsePayload.status, responsePayload.statusText, headersObject(responsePayload.headers), getResponseBody);
   }

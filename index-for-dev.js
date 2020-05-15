@@ -1,0 +1,24 @@
+/**
+ * Copyright (c) Microsoft Corporation.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+const { Playwright } = require('./lib/server/playwright');
+const { Electron } = require('./lib/server/electron');
+const path = require('path');
+
+const playwrightRoot = path.join(__dirname, 'packages', 'playwright');
+const playwright = new Playwright(playwrightRoot, require(path.join(playwrightRoot, 'browsers.json'))['browsers']);
+playwright.electron = new Electron();
+module.exports = playwright;

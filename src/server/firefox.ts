@@ -15,87 +15,120 @@
  * limitations under the License.
  */
 
-import { FFBrowser } from '../firefox/ffBrowser';
-import { BrowserFetcher, BrowserFetcherOptions } from './browserFetcher';
-import { DeviceDescriptors } from '../deviceDescriptors';
-import { launchProcess, waitForLine } from './processLauncher';
-import * as types from '../types';
-import * as platform from '../platform';
-import { kBrowserCloseMessageId } from '../firefox/ffConnection';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import * as util from 'util';
+import * as ws from 'ws';
+import { LaunchType } from '../browser';
+import { BrowserContext } from '../browserContext';
 import { TimeoutError } from '../errors';
-import { assert } from '../helper';
-import { LaunchOptions, BrowserArgOptions, BrowserType } from './browserType';
-import { createTransport, ConnectOptions } from '../browser';
-import { BrowserApp } from './browserApp';
 import { Events } from '../events';
+import { FFBrowser } from '../firefox/ffBrowser';
+import { kBrowserCloseMessageId } from '../firefox/ffConnection';
+import { helper, assert } from '../helper';
+import { BrowserServer, WebSocketWrapper } from './browserServer';
+import { BrowserArgOptions, LaunchOptions, LaunchServerOptions, ConnectOptions, AbstractBrowserType, processBrowserArgOptions } from './browserType';
+import { launchProcess, waitForLine } from './processLauncher';
+import { ConnectionTransport, SequenceNumberMixer, WebSocketTransport } from '../transport';
+import { RootLogger, InnerLogger, logError } from '../logger';
+import { BrowserDescriptor } from '../install/browserPaths';
+import { TimeoutSettings } from '../timeoutSettings';
 
-export class Firefox implements BrowserType {
-  private _projectRoot: string;
-  readonly _revision: string;
+const mkdtempAsync = util.promisify(fs.mkdtemp);
 
-  constructor(projectRoot: string, preferredRevision: string) {
-    this._projectRoot = projectRoot;
-    this._revision = preferredRevision;
+export class Firefox extends AbstractBrowserType<FFBrowser> {
+  constructor(packagePath: string, browser: BrowserDescriptor) {
+    super(packagePath, browser);
   }
 
-  name() {
-    return 'firefox';
+  async launch(options: LaunchOptions = {}): Promise<FFBrowser> {
+    assert(!(options as any).userDataDir, 'userDataDir option is not supported in `browserType.launch`. Use `browserType.launchPersistentContext` instead');
+    const { timeout = 30000 } = options;
+    const deadline = TimeoutSettings.computeDeadline(timeout);
+    const { browserServer, downloadsPath, logger } = await this._launchServer(options, 'local');
+    return await browserServer._initializeOrClose(deadline, async () => {
+      if ((options as any).__testHookBeforeCreateBrowser)
+        await (options as any).__testHookBeforeCreateBrowser();
+      const browser = await WebSocketTransport.connect(browserServer.wsEndpoint()!, transport => {
+        return FFBrowser.connect(transport, {
+          slowMo: options.slowMo,
+          logger,
+          downloadsPath,
+          headful: !processBrowserArgOptions(options).headless,
+          ownedServer: browserServer,
+        });
+      });
+      return browser;
+    });
   }
 
-  async launch(options?: LaunchOptions): Promise<FFBrowser> {
-    const app = await this.launchBrowserApp(options);
-    const browser = await FFBrowser.connect(app.connectOptions());
-    // Hack: for typical launch scenario, ensure that close waits for actual process termination.
-    browser.close = () => app.close();
-    return browser;
+  async launchServer(options: LaunchServerOptions = {}): Promise<BrowserServer> {
+    return (await this._launchServer(options, 'server')).browserServer;
   }
 
-  async launchBrowserApp(options: LaunchOptions = {}): Promise<BrowserApp> {
+  async launchPersistentContext(userDataDir: string, options: LaunchOptions = {}): Promise<BrowserContext> {
+    const { timeout = 30000 } = options;
+    const deadline = TimeoutSettings.computeDeadline(timeout);
+    const { browserServer, downloadsPath, logger } = await this._launchServer(options, 'persistent', userDataDir);
+    return await browserServer._initializeOrClose(deadline, async () => {
+      if ((options as any).__testHookBeforeCreateBrowser)
+        await (options as any).__testHookBeforeCreateBrowser();
+      const browser = await WebSocketTransport.connect(browserServer.wsEndpoint()!, transport => {
+        return FFBrowser.connect(transport, {
+          slowMo: options.slowMo,
+          logger,
+          persistent: true,
+          downloadsPath,
+          ownedServer: browserServer,
+          headful: !processBrowserArgOptions(options).headless,
+        });
+      });
+      const context = browser._defaultContext!;
+      if (!options.ignoreDefaultArgs || Array.isArray(options.ignoreDefaultArgs))
+        await context._loadDefaultContext();
+      return context;
+    });
+  }
+
+  private async _launchServer(options: LaunchServerOptions, launchType: LaunchType, userDataDir?: string): Promise<{ browserServer: BrowserServer, downloadsPath: string, logger: InnerLogger }> {
     const {
       ignoreDefaultArgs = false,
       args = [],
-      dumpio = false,
       executablePath = null,
       env = process.env,
       handleSIGHUP = true,
       handleSIGINT = true,
       handleSIGTERM = true,
-      slowMo = 0,
       timeout = 30000,
-      webSocket = false,
+      port = 0,
     } = options;
+    assert(!port || launchType === 'server', 'Cannot specify a port without launching as a server.');
+    const logger = new RootLogger(options.logger);
+
+    let temporaryProfileDir = null;
+    if (!userDataDir) {
+      userDataDir = await mkdtempAsync(path.join(os.tmpdir(), 'playwright_dev_firefox_profile-'));
+      temporaryProfileDir = userDataDir;
+    }
 
     const firefoxArguments = [];
     if (!ignoreDefaultArgs)
-      firefoxArguments.push(...this.defaultArgs(options));
+      firefoxArguments.push(...this._defaultArgs(options, launchType, userDataDir, 0));
     else if (Array.isArray(ignoreDefaultArgs))
-      firefoxArguments.push(...this.defaultArgs(options).filter(arg => !ignoreDefaultArgs.includes(arg)));
+      firefoxArguments.push(...this._defaultArgs(options, launchType, userDataDir, 0).filter(arg => !ignoreDefaultArgs.includes(arg)));
     else
       firefoxArguments.push(...args);
 
-    if (!firefoxArguments.includes('-juggler'))
-      firefoxArguments.unshift('-juggler', '0');
+    const firefoxExecutable = executablePath || this.executablePath();
+    if (!firefoxExecutable)
+      throw new Error(`No executable path is specified. Pass "executablePath" option directly.`);
 
-    let temporaryProfileDir = null;
-    if (!firefoxArguments.includes('-profile') && !firefoxArguments.includes('--profile')) {
-      temporaryProfileDir = await createProfile();
-      firefoxArguments.unshift(`-profile`, temporaryProfileDir);
-    }
-
-    let firefoxExecutable = executablePath;
-    if (!firefoxExecutable) {
-      const {missingText, executablePath} = this._resolveExecutablePath();
-      if (missingText)
-        throw new Error(missingText);
-      firefoxExecutable = executablePath;
-    }
-
-    let browserApp: BrowserApp | undefined = undefined;
-    const { launchedProcess, gracefullyClose } = await launchProcess({
+    // Note: it is important to define these variables before launchProcess, so that we don't get
+    // "Cannot access 'browserServer' before initialization" if something went wrong.
+    let browserServer: BrowserServer | undefined = undefined;
+    let browserWSEndpoint: string | undefined = undefined;
+    const { launchedProcess, gracefullyClose, downloadsPath } = await launchProcess({
       executablePath: firefoxExecutable,
       args: firefoxArguments,
       env: os.platform() === 'linux' ? {
@@ -106,354 +139,194 @@ export class Firefox implements BrowserType {
       handleSIGINT,
       handleSIGTERM,
       handleSIGHUP,
-      dumpio,
+      logger,
       pipe: false,
       tempDir: temporaryProfileDir || undefined,
       attemptToGracefullyClose: async () => {
-        if (!browserApp)
-          return Promise.reject();
+        assert(browserServer);
         // We try to gracefully close to prevent crash reporting and core dumps.
-        // Note that it's fine to reuse the pipe transport, since
-        // our connection ignores kBrowserCloseMessageId.
-        const transport = await createTransport(browserApp.connectOptions());
+        const transport = await WebSocketTransport.connect(browserWSEndpoint!, async transport => transport);
         const message = { method: 'Browser.close', params: {}, id: kBrowserCloseMessageId };
-        transport.send(JSON.stringify(message));
+        await transport.send(message);
       },
       onkill: (exitCode, signal) => {
-        if (browserApp)
-          browserApp.emit(Events.BrowserApp.Close, exitCode, signal);
+        if (browserServer)
+          browserServer.emit(Events.BrowserServer.Close, exitCode, signal);
       },
     });
 
     const timeoutError = new TimeoutError(`Timed out after ${timeout} ms while trying to connect to Firefox!`);
     const match = await waitForLine(launchedProcess, launchedProcess.stdout, /^Juggler listening on (ws:\/\/.*)$/, timeout, timeoutError);
-    const browserWSEndpoint = match[1];
-    let connectOptions: ConnectOptions;
-    if (webSocket) {
-      connectOptions = { browserWSEndpoint, slowMo };
-    } else {
-      const transport = await platform.createWebSocketTransport(browserWSEndpoint);
-      connectOptions = { transport, slowMo };
-    }
-    browserApp = new BrowserApp(launchedProcess, gracefullyClose, connectOptions);
-    return browserApp;
+    const innerEndpoint = match[1];
+
+    const webSocketWrapper = launchType === 'server' ? (await WebSocketTransport.connect(innerEndpoint, t => wrapTransportWithWebSocket(t, logger, port))) : new WebSocketWrapper(innerEndpoint, []);
+    browserWSEndpoint = webSocketWrapper.wsEndpoint;
+    browserServer = new BrowserServer(launchedProcess, gracefullyClose, webSocketWrapper);
+    return { browserServer, downloadsPath, logger };
   }
 
-  async connect(options: ConnectOptions & { browserURL?: string }): Promise<FFBrowser> {
-    if (options.browserURL)
-      throw new Error('Option "browserURL" is not supported by Firefox');
-    if (options.transport && options.transport.onmessage)
-      throw new Error('Transport is already in use');
-    return FFBrowser.connect(options);
-  }
-
-  executablePath(): string {
-    return this._resolveExecutablePath().executablePath;
-  }
-
-  get devices(): types.Devices {
-    return DeviceDescriptors;
-  }
-
-  get errors(): { TimeoutError: typeof TimeoutError } {
-    return { TimeoutError };
-  }
-
-  defaultArgs(options: BrowserArgOptions = {}): string[] {
-    const {
-      devtools = false,
-      headless = !devtools,
-      args = [],
-      userDataDir = null,
-    } = options;
-    if (devtools)
-      throw new Error('Option "devtools" is not supported by Firefox');
-    const firefoxArguments = [...DEFAULT_ARGS];
-    if (userDataDir)
-      firefoxArguments.push('-profile', userDataDir);
-    if (headless)
-      firefoxArguments.push('-headless');
-    else
-      firefoxArguments.push('-wait-for-browser');
-    firefoxArguments.push(...args);
-    if (args.every(arg => arg.startsWith('-')))
-      firefoxArguments.push('about:blank');
-    return firefoxArguments;
-  }
-
-  _createBrowserFetcher(options: BrowserFetcherOptions = {}): BrowserFetcher {
-    const downloadURLs = {
-      linux: '%s/builds/firefox/%s/firefox-linux.zip',
-      mac: '%s/builds/firefox/%s/firefox-mac.zip',
-      win32: '%s/builds/firefox/%s/firefox-win32.zip',
-      win64: '%s/builds/firefox/%s/firefox-win64.zip',
-    };
-
-    const defaultOptions = {
-      path: path.join(this._projectRoot, '.local-firefox'),
-      host: 'https://playwright.azureedge.net',
-      platform: (() => {
-        const platform = os.platform();
-        if (platform === 'darwin')
-          return 'mac';
-        if (platform === 'linux')
-          return 'linux';
-        if (platform === 'win32')
-          return os.arch() === 'x64' ? 'win64' : 'win32';
-        return platform;
-      })()
-    };
-    options = {
-      ...defaultOptions,
-      ...options,
-    };
-    assert(!!(downloadURLs as any)[options.platform!], 'Unsupported platform: ' + options.platform);
-
-    return new BrowserFetcher(options.path!, options.platform!, this._revision, (platform: string, revision: string) => {
-      let executablePath = '';
-      if (platform === 'linux')
-        executablePath = path.join('firefox', 'firefox');
-      else if (platform === 'mac')
-        executablePath = path.join('firefox', 'Nightly.app', 'Contents', 'MacOS', 'firefox');
-      else if (platform === 'win32' || platform === 'win64')
-        executablePath = path.join('firefox', 'firefox.exe');
-      return {
-        downloadUrl: util.format((downloadURLs as any)[platform], options.host, revision),
-        executablePath
-      };
+  async connect(options: ConnectOptions): Promise<FFBrowser> {
+    return await WebSocketTransport.connect(options.wsEndpoint, async transport => {
+      if ((options as any).__testHookBeforeCreateBrowser)
+        await (options as any).__testHookBeforeCreateBrowser();
+      return FFBrowser.connect(transport, { slowMo: options.slowMo, logger: new RootLogger(options.logger), downloadsPath: '' });
     });
   }
 
-  _resolveExecutablePath() {
-    const browserFetcher = this._createBrowserFetcher();
-    const revisionInfo = browserFetcher.revisionInfo();
-    const missingText = !revisionInfo.local ? `Firefox revision is not downloaded. Run "npm install" or "yarn install"` : null;
-    return { executablePath: revisionInfo.executablePath, missingText };
+  private _defaultArgs(options: BrowserArgOptions = {}, launchType: LaunchType, userDataDir: string, port: number): string[] {
+    const { devtools, headless } = processBrowserArgOptions(options);
+    const { args = [] } = options;
+    if (devtools)
+      console.warn('devtools parameter is not supported as a launch argument in Firefox. You can launch the devtools window manually.');
+    const userDataDirArg = args.find(arg => arg.startsWith('-profile') || arg.startsWith('--profile'));
+    if (userDataDirArg)
+      throw new Error('Pass userDataDir parameter instead of specifying -profile argument');
+    if (args.find(arg => arg.startsWith('-juggler')))
+      throw new Error('Use the port parameter instead of -juggler argument');
+
+    const firefoxArguments = ['-no-remote'];
+    if (headless) {
+      firefoxArguments.push('-headless');
+    } else {
+      firefoxArguments.push('-wait-for-browser');
+      firefoxArguments.push('-foreground');
+    }
+    firefoxArguments.push(`-profile`, userDataDir);
+    firefoxArguments.push('-juggler', String(port));
+    firefoxArguments.push(...args);
+    if (launchType === 'persistent')
+      firefoxArguments.push('about:blank');
+    else
+      firefoxArguments.push('-silent');
+    return firefoxArguments;
   }
 }
 
-const mkdtempAsync = platform.promisify(fs.mkdtemp);
-const writeFileAsync = platform.promisify(fs.writeFile);
+function wrapTransportWithWebSocket(transport: ConnectionTransport, logger: InnerLogger, port: number): WebSocketWrapper {
+  const server = new ws.Server({ port });
+  const guid = helper.guid();
+  const idMixer = new SequenceNumberMixer<{id: number, socket: ws}>();
+  const pendingBrowserContextCreations = new Set<number>();
+  const pendingBrowserContextDeletions = new Map<number, string>();
+  const browserContextIds = new Map<string, ws>();
+  const sessionToSocket = new Map<string, ws>();
+  const sockets = new Set<ws>();
 
-const DEFAULT_ARGS = [
-  '-no-remote',
-];
+  transport.onmessage = message => {
+    if (typeof message.id === 'number') {
+      // Process command response.
+      const seqNum = message.id;
+      const value = idMixer.take(seqNum);
+      if (!value)
+        return;
+      const { id, socket } = value;
 
-const DUMMY_UMA_SERVER = 'dummy.test';
-const DEFAULT_PREFERENCES = {
-  // Make sure Shield doesn't hit the network.
-  'app.normandy.api_url': '',
-  // Disable Firefox old build background check
-  'app.update.checkInstallTime': false,
-  // Disable automatically upgrading Firefox
-  'app.update.disabledForTesting': true,
+      if (socket.readyState === ws.CLOSING) {
+        if (pendingBrowserContextCreations.has(id)) {
+          transport.send({
+            id: ++SequenceNumberMixer._lastSequenceNumber,
+            method: 'Browser.removeBrowserContext',
+            params: { browserContextId: message.result.browserContextId }
+          });
+        }
+        return;
+      }
 
-  // Increase the APZ content response timeout to 1 minute
-  'apz.content_response_timeout': 60000,
+      if (pendingBrowserContextCreations.has(seqNum)) {
+        // Browser.createBrowserContext response -> establish context attribution.
+        browserContextIds.set(message.result.browserContextId, socket);
+        pendingBrowserContextCreations.delete(seqNum);
+      }
 
-  // Prevent various error message on the console
-  // jest-puppeteer asserts that no error message is emitted by the console
-  'browser.contentblocking.features.standard': '-tp,tpPrivate,cookieBehavior0,-cm,-fp',
+      const deletedContextId = pendingBrowserContextDeletions.get(seqNum);
+      if (deletedContextId) {
+        // Browser.removeBrowserContext response -> remove context attribution.
+        browserContextIds.delete(deletedContextId);
+        pendingBrowserContextDeletions.delete(seqNum);
+      }
 
+      message.id = id;
+      socket.send(JSON.stringify(message));
+      return;
+    }
 
-  // Enable the dump function: which sends messages to the system
-  // console
-  // https://bugzilla.mozilla.org/show_bug.cgi?id=1543115
-  'browser.dom.window.dump.enabled': true,
-  // Disable topstories
-  'browser.newtabpage.activity-stream.feeds.section.topstories': false,
-  // Always display a blank page
-  'browser.newtabpage.enabled': false,
-  // Background thumbnails in particular cause grief: and disabling
-  // thumbnails in general cannot hurt
-  'browser.pagethumbnails.capturing_disabled': true,
+    // Process notification response.
+    const { method, params, sessionId } = message;
+    if (sessionId) {
+      const socket = sessionToSocket.get(sessionId);
+      if (!socket || socket.readyState === ws.CLOSING) {
+        // Drop unattributed messages on the floor.
+        return;
+      }
+      socket.send(JSON.stringify(message));
+      return;
+    }
+    if (method === 'Browser.attachedToTarget') {
+      const socket = browserContextIds.get(params.targetInfo.browserContextId);
+      if (!socket || socket.readyState === ws.CLOSING) {
+        // Drop unattributed messages on the floor.
+        return;
+      }
+      sessionToSocket.set(params.sessionId, socket);
+      socket.send(JSON.stringify(message));
+      return;
+    }
+    if (method === 'Browser.detachedFromTarget') {
+      const socket = sessionToSocket.get(params.sessionId);
+      sessionToSocket.delete(params.sessionId);
+      if (socket && socket.readyState !== ws.CLOSING)
+        socket.send(JSON.stringify(message));
+      return;
+    }
+  };
 
-  // Disable safebrowsing components.
-  'browser.safebrowsing.blockedURIs.enabled': false,
-  'browser.safebrowsing.downloads.enabled': false,
-  'browser.safebrowsing.malware.enabled': false,
-  'browser.safebrowsing.passwords.enabled': false,
-  'browser.safebrowsing.phishing.enabled': false,
+  transport.onclose = () => {
+    for (const socket of sockets) {
+      socket.removeListener('close', (socket as any).__closeListener);
+      socket.close(undefined, 'Browser disconnected');
+    }
+    server.close();
+    transport.onmessage = undefined;
+    transport.onclose = undefined;
+  };
 
-  // Disable updates to search engines.
-  'browser.search.update': false,
-  // Do not restore the last open set of tabs if the browser has crashed
-  'browser.sessionstore.resume_from_crash': false,
-  // Skip check for default browser on startup
-  'browser.shell.checkDefaultBrowser': false,
+  server.on('connection', (socket: ws, req) => {
+    if (req.url !== '/' + guid) {
+      socket.close();
+      return;
+    }
+    sockets.add(socket);
 
-  // Disable newtabpage
-  'browser.startup.homepage': 'about:blank',
-  // Do not redirect user when a milstone upgrade of Firefox is detected
-  'browser.startup.homepage_override.mstone': 'ignore',
-  // Start with a blank page about:blank
-  'browser.startup.page': 0,
+    socket.on('message', (message: string) => {
+      const parsedMessage = JSON.parse(Buffer.from(message).toString());
+      const { id, method, params } = parsedMessage;
+      const seqNum = idMixer.generate({ id, socket });
+      transport.send({ ...parsedMessage, id: seqNum });
+      if (method === 'Browser.createBrowserContext')
+        pendingBrowserContextCreations.add(seqNum);
+      if (method === 'Browser.removeBrowserContext')
+        pendingBrowserContextDeletions.set(seqNum, params.browserContextId);
+    });
 
-  // Do not allow background tabs to be zombified on Android: otherwise for
-  // tests that open additional tabs: the test harness tab itself might get
-  // unloaded
-  'browser.tabs.disableBackgroundZombification': false,
-  // Do not warn when closing all other open tabs
-  'browser.tabs.warnOnCloseOtherTabs': false,
-  // Do not warn when multiple tabs will be opened
-  'browser.tabs.warnOnOpen': false,
+    socket.on('error', logError(logger));
 
-  // Disable the UI tour.
-  'browser.uitour.enabled': false,
-  // Turn off search suggestions in the location bar so as not to trigger
-  // network connections.
-  'browser.urlbar.suggest.searches': false,
-  // Disable first run splash page on Windows 10
-  'browser.usedOnWindows10.introURL': '',
-  // Do not warn on quitting Firefox
-  'browser.warnOnQuit': false,
+    socket.on('close', (socket as any).__closeListener = () => {
+      for (const [browserContextId, s] of browserContextIds) {
+        if (s === socket) {
+          transport.send({
+            id: ++SequenceNumberMixer._lastSequenceNumber,
+            method: 'Browser.removeBrowserContext',
+            params: { browserContextId }
+          });
+          browserContextIds.delete(browserContextId);
+        }
+      }
+      sockets.delete(socket);
+    });
+  });
 
-  // Do not show datareporting policy notifications which can
-  // interfere with tests
-  'datareporting.healthreport.about.reportUrl': `http://${DUMMY_UMA_SERVER}/dummy/abouthealthreport/`,
-  'datareporting.healthreport.documentServerURI': `http://${DUMMY_UMA_SERVER}/dummy/healthreport/`,
-  'datareporting.healthreport.logging.consoleEnabled': false,
-  'datareporting.healthreport.service.enabled': false,
-  'datareporting.healthreport.service.firstRun': false,
-  'datareporting.healthreport.uploadEnabled': false,
-  'datareporting.policy.dataSubmissionEnabled': false,
-  'datareporting.policy.dataSubmissionPolicyAccepted': false,
-  'datareporting.policy.dataSubmissionPolicyBypassNotification': true,
-
-  // DevTools JSONViewer sometimes fails to load dependencies with its require.js.
-  // This doesn't affect Puppeteer but spams console (Bug 1424372)
-  'devtools.jsonview.enabled': false,
-
-  // Disable popup-blocker
-  'dom.disable_open_during_load': false,
-
-  // Enable the support for File object creation in the content process
-  // Required for |Page.setFileInputFiles| protocol method.
-  'dom.file.createInChild': true,
-
-  // Disable the ProcessHangMonitor
-  'dom.ipc.reportProcessHangs': false,
-
-  // Disable slow script dialogues
-  'dom.max_chrome_script_run_time': 0,
-  'dom.max_script_run_time': 0,
-
-  // Only load extensions from the application and user profile
-  // AddonManager.SCOPE_PROFILE + AddonManager.SCOPE_APPLICATION
-  'extensions.autoDisableScopes': 0,
-  'extensions.enabledScopes': 5,
-
-  // Disable metadata caching for installed add-ons by default
-  'extensions.getAddons.cache.enabled': false,
-
-  // Disable installing any distribution extensions or add-ons.
-  'extensions.installDistroAddons': false,
-
-  // Disabled screenshots extension
-  'extensions.screenshots.disabled': true,
-
-  // Turn off extension updates so they do not bother tests
-  'extensions.update.enabled': false,
-
-  // Turn off extension updates so they do not bother tests
-  'extensions.update.notifyUser': false,
-
-  // Make sure opening about:addons will not hit the network
-  'extensions.webservice.discoverURL': `http://${DUMMY_UMA_SERVER}/dummy/discoveryURL`,
-
-  // Allow the application to have focus even it runs in the background
-  'focusmanager.testmode': true,
-  // Disable useragent updates
-  'general.useragent.updates.enabled': false,
-  // Always use network provider for geolocation tests so we bypass the
-  // macOS dialog raised by the corelocation provider
-  'geo.provider.testing': true,
-  // Do not scan Wifi
-  'geo.wifi.scan': false,
-
-  // No ICC color correction. See
-  // https://developer.mozilla.org/en/docs/Mozilla/Firefox/Releases/3.5/ICC_color_correction_in_Firefox.
-  'gfx.color_management.mode': 0,
-  'gfx.color_management.rendering_intent': 3,
-
-  // No hang monitor
-  'hangmonitor.timeout': 0,
-  // Show chrome errors and warnings in the error console
-  'javascript.options.showInConsole': true,
-
-  // Disable download and usage of OpenH264: and Widevine plugins
-  'media.gmp-manager.updateEnabled': false,
-  // Prevent various error message on the console
-  // jest-puppeteer asserts that no error message is emitted by the console
-  'network.cookie.cookieBehavior': 0,
-
-  // Do not prompt for temporary redirects
-  'network.http.prompt-temp-redirect': false,
-
-  // Disable speculative connections so they are not reported as leaking
-  // when they are hanging around
-  'network.http.speculative-parallel-limit': 0,
-
-  // Do not automatically switch between offline and online
-  'network.manage-offline-status': false,
-
-  // Make sure SNTP requests do not hit the network
-  'network.sntp.pools': DUMMY_UMA_SERVER,
-
-  // Disable Flash.
-  'plugin.state.flash': 0,
-
-  'privacy.trackingprotection.enabled': false,
-
-  // Enable Remote Agent
-  // https://bugzilla.mozilla.org/show_bug.cgi?id=1544393
-  'remote.enabled': true,
-
-  // Don't do network connections for mitm priming
-  'security.certerrors.mitm.priming.enabled': false,
-  // Local documents have access to all other local documents,
-  // including directory listings
-  'security.fileuri.strict_origin_policy': false,
-  // Do not wait for the notification button security delay
-  'security.notification_enable_delay': 0,
-
-  // Ensure blocklist updates do not hit the network
-  'services.settings.server': `http://${DUMMY_UMA_SERVER}/dummy/blocklist/`,
-
-  'browser.tabs.documentchannel': false,
-
-  // Do not automatically fill sign-in forms with known usernames and
-  // passwords
-  'signon.autofillForms': false,
-  // Disable password capture, so that tests that include forms are not
-  // influenced by the presence of the persistent doorhanger notification
-  'signon.rememberSignons': false,
-
-  // Disable first-run welcome page
-  'startup.homepage_welcome_url': 'about:blank',
-
-  // Disable first-run welcome page
-  'startup.homepage_welcome_url.additional': '',
-
-  // Disable browser animations (tabs, fullscreen, sliding alerts)
-  'toolkit.cosmeticAnimations.enabled': false,
-
-  // We want to collect telemetry, but we don't want to send in the results
-  'toolkit.telemetry.server': `https://${DUMMY_UMA_SERVER}/dummy/telemetry/`,
-  // Prevent starting into safe mode after application crashes
-  'toolkit.startup.max_resumed_crashes': -1,
-};
-
-async function createProfile(extraPrefs?: object): Promise<string> {
-  const profilePath = await mkdtempAsync(path.join(os.tmpdir(), 'playwright_dev_firefox_profile-'));
-  const prefsJS: string[] = [];
-  const userJS: string[] = [];
-
-  const prefs = { ...DEFAULT_PREFERENCES, ...extraPrefs };
-  for (const [key, value] of Object.entries(prefs))
-    userJS.push(`user_pref(${JSON.stringify(key)}, ${JSON.stringify(value)});`);
-
-  await writeFileAsync(path.join(profilePath, 'user.js'), userJS.join('\n'));
-  await writeFileAsync(path.join(profilePath, 'prefs.js'), prefsJS.join('\n'));
-  return profilePath;
+  const address = server.address();
+  const wsEndpoint = typeof address === 'string' ? `${address}/${guid}` : `ws://127.0.0.1:${address.port}/${guid}`;
+  return new WebSocketWrapper(wsEndpoint,
+      [pendingBrowserContextCreations, pendingBrowserContextDeletions, browserContextIds, sessionToSocket, sockets]);
 }

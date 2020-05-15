@@ -14,38 +14,72 @@
  * limitations under the License.
  */
 
-import * as types from '../types';
-import { TimeoutError } from '../errors';
-import { Browser, ConnectOptions } from '../browser';
-import { BrowserApp } from './browserApp';
+import { BrowserContext } from '../browserContext';
+import { BrowserServer } from './browserServer';
+import * as browserPaths from '../install/browserPaths';
+import { Logger } from '../logger';
 
 export type BrowserArgOptions = {
   headless?: boolean,
   args?: string[],
-  userDataDir?: string,
   devtools?: boolean,
 };
 
-export type LaunchOptions = BrowserArgOptions & {
+type LaunchOptionsBase = BrowserArgOptions & {
   executablePath?: string,
   ignoreDefaultArgs?: boolean | string[],
   handleSIGINT?: boolean,
   handleSIGTERM?: boolean,
   handleSIGHUP?: boolean,
   timeout?: number,
-  dumpio?: boolean,
-  env?: {[key: string]: string} | undefined,
-  webSocket?: boolean,
-  slowMo?: number,  // TODO: we probably don't want this in launchBrowserApp.
+  logger?: Logger,
+  env?: {[key: string]: string|number|boolean}
 };
 
-export interface BrowserType {
+export function processBrowserArgOptions(options: LaunchOptionsBase): { devtools: boolean, headless: boolean } {
+  const { devtools = false, headless = !devtools } = options;
+  return { devtools, headless };
+}
+
+export type ConnectOptions = {
+  wsEndpoint: string,
+  slowMo?: number,
+  logger?: Logger,
+};
+export type LaunchOptions = LaunchOptionsBase & { slowMo?: number };
+export type LaunchServerOptions = LaunchOptionsBase & { port?: number };
+export interface BrowserType<Browser> {
   executablePath(): string;
   name(): string;
-  launchBrowserApp(options?: LaunchOptions): Promise<BrowserApp>;
   launch(options?: LaunchOptions): Promise<Browser>;
-  defaultArgs(options?: BrowserArgOptions): string[];
-  connect(options: ConnectOptions & { browserURL?: string }): Promise<Browser>;
-  devices: types.Devices;
-  errors: { TimeoutError: typeof TimeoutError };
+  launchServer(options?: LaunchServerOptions): Promise<BrowserServer>;
+  launchPersistentContext(userDataDir: string, options?: LaunchOptions): Promise<BrowserContext>;
+  connect(options: ConnectOptions): Promise<Browser>;
+}
+
+export abstract class AbstractBrowserType<Browser> implements BrowserType<Browser> {
+  private _name: string;
+  private _executablePath: string | undefined;
+
+  constructor(packagePath: string, browser: browserPaths.BrowserDescriptor) {
+    this._name = browser.name;
+    const browsersPath = browserPaths.browsersPath(packagePath);
+    const browserPath = browserPaths.browserDirectory(browsersPath, browser);
+    this._executablePath = browserPaths.executablePath(browserPath, browser);
+  }
+
+  executablePath(): string {
+    if (!this._executablePath)
+      throw new Error('Browser is not supported on current platform');
+    return this._executablePath;
+  }
+
+  name(): string {
+    return this._name;
+  }
+
+  abstract launch(options?: LaunchOptions): Promise<Browser>;
+  abstract launchServer(options?: LaunchServerOptions): Promise<BrowserServer>;
+  abstract launchPersistentContext(userDataDir: string, options?: LaunchOptions): Promise<BrowserContext>;
+  abstract connect(options: ConnectOptions): Promise<Browser>;
 }
